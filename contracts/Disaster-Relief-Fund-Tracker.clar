@@ -8,10 +8,17 @@
 (define-constant err-insufficient-funds (err u106))
 (define-constant err-invalid-target (err u107))
 (define-constant err-invalid-duration (err u108))
+(define-constant err-withdrawal-not-found (err u109))
+(define-constant err-withdrawal-already-executed (err u110))
+(define-constant err-withdrawal-period-not-ended (err u111))
+(define-constant err-insufficient-campaign-funds (err u112))
+(define-constant err-withdrawal-amount-invalid (err u113))
 
 (define-data-var next-campaign-id uint u1)
 (define-data-var total-campaigns uint u0)
 (define-data-var total-donated uint u0)
+(define-data-var next-withdrawal-id uint u1)
+(define-data-var emergency-withdrawal-delay uint u144)
 
 (define-map campaigns
     { campaign-id: uint }
@@ -49,6 +56,30 @@
 (define-map campaign-donors
     { campaign-id: uint }
     { donor-count: uint }
+)
+
+(define-map emergency-withdrawals
+    { withdrawal-id: uint }
+    {
+        campaign-id: uint,
+        requester: principal,
+        amount: uint,
+        reason: (string-ascii 200),
+        requested-at: uint,
+        executable-at: uint,
+        executed: bool,
+    }
+)
+
+(define-map withdrawal-objections
+    {
+        withdrawal-id: uint,
+        objector: principal,
+    }
+    {
+        objected-at: uint,
+        reason: (string-ascii 200),
+    }
 )
 
 (define-public (create-campaign
@@ -111,7 +142,7 @@
         (asserts! (is-eq (get status campaign-data) "active")
             err-campaign-completed
         )
-        (try! (stx-transfer? amount tx-sender (get creator campaign-data)))
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (let (
                 (new-raised (+ (get raised-amount campaign-data) amount))
                 (new-status (if (>= new-raised (get target-amount campaign-data))
@@ -203,6 +234,137 @@
     )
 )
 
+(define-public (request-emergency-withdrawal
+        (campaign-id uint)
+        (amount uint)
+        (reason (string-ascii 200))
+    )
+    (let (
+            (campaign-data (unwrap! (map-get? campaigns { campaign-id: campaign-id })
+                err-not-found
+            ))
+            (withdrawal-id (var-get next-withdrawal-id))
+            (current-height stacks-block-height)
+            (executable-at (+ current-height (var-get emergency-withdrawal-delay)))
+        )
+        (asserts! (is-eq (get creator campaign-data) tx-sender) err-unauthorized)
+        (asserts! (is-eq (get status campaign-data) "active")
+            err-campaign-completed
+        )
+        (asserts! (> amount u0) err-withdrawal-amount-invalid)
+        (asserts! (<= amount (get raised-amount campaign-data))
+            err-insufficient-campaign-funds
+        )
+        (map-set emergency-withdrawals { withdrawal-id: withdrawal-id } {
+            campaign-id: campaign-id,
+            requester: tx-sender,
+            amount: amount,
+            reason: reason,
+            requested-at: current-height,
+            executable-at: executable-at,
+            executed: false,
+        })
+        (var-set next-withdrawal-id (+ withdrawal-id u1))
+        (ok withdrawal-id)
+    )
+)
+
+(define-public (object-to-withdrawal
+        (withdrawal-id uint)
+        (objection-reason (string-ascii 200))
+    )
+    (let (
+            (withdrawal-data (unwrap!
+                (map-get? emergency-withdrawals { withdrawal-id: withdrawal-id })
+                err-withdrawal-not-found
+            ))
+            (campaign-data (unwrap!
+                (map-get? campaigns { campaign-id: (get campaign-id withdrawal-data) })
+                err-not-found
+            ))
+            (donation-data (map-get? donations {
+                campaign-id: (get campaign-id withdrawal-data),
+                donor: tx-sender,
+            }))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-some donation-data) err-unauthorized)
+        (asserts! (not (get executed withdrawal-data))
+            err-withdrawal-already-executed
+        )
+        (asserts! (< current-height (get executable-at withdrawal-data))
+            err-withdrawal-period-not-ended
+        )
+        (map-set withdrawal-objections {
+            withdrawal-id: withdrawal-id,
+            objector: tx-sender,
+        } {
+            objected-at: current-height,
+            reason: objection-reason,
+        })
+        (ok true)
+    )
+)
+
+(define-public (execute-emergency-withdrawal (withdrawal-id uint))
+    (let (
+            (withdrawal-data (unwrap!
+                (map-get? emergency-withdrawals { withdrawal-id: withdrawal-id })
+                err-withdrawal-not-found
+            ))
+            (campaign-data (unwrap!
+                (map-get? campaigns { campaign-id: (get campaign-id withdrawal-data) })
+                err-not-found
+            ))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-eq (get requester withdrawal-data) tx-sender)
+            err-unauthorized
+        )
+        (asserts! (not (get executed withdrawal-data))
+            err-withdrawal-already-executed
+        )
+        (asserts! (>= current-height (get executable-at withdrawal-data))
+            err-withdrawal-period-not-ended
+        )
+        (asserts!
+            (<= (get amount withdrawal-data) (get raised-amount campaign-data))
+            err-insufficient-campaign-funds
+        )
+        (try! (as-contract (stx-transfer? (get amount withdrawal-data) (as-contract tx-sender)
+            tx-sender
+        )))
+        (let ((new-raised (- (get raised-amount campaign-data) (get amount withdrawal-data))))
+            (map-set campaigns { campaign-id: (get campaign-id withdrawal-data) }
+                (merge campaign-data { raised-amount: new-raised })
+            )
+            (map-set emergency-withdrawals { withdrawal-id: withdrawal-id }
+                (merge withdrawal-data { executed: true })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (withdraw-completed-funds (campaign-id uint))
+    (let ((campaign-data (unwrap! (map-get? campaigns { campaign-id: campaign-id }) err-not-found)))
+        (asserts! (is-eq (get creator campaign-data) tx-sender) err-unauthorized)
+        (asserts! (is-eq (get status campaign-data) "completed")
+            err-campaign-completed
+        )
+        (asserts! (> (get raised-amount campaign-data) u0)
+            err-insufficient-campaign-funds
+        )
+        (try! (as-contract (stx-transfer? (get raised-amount campaign-data) (as-contract tx-sender)
+            tx-sender
+        )))
+        (map-set campaigns { campaign-id: campaign-id }
+            (merge campaign-data { raised-amount: u0 })
+        )
+        (ok true)
+    )
+)
+
 (define-read-only (get-campaign (campaign-id uint))
     (map-get? campaigns { campaign-id: campaign-id })
 )
@@ -272,4 +434,32 @@
         total-donated: (var-get total-donated),
         next-campaign-id: (var-get next-campaign-id),
     }
+)
+
+(define-read-only (get-withdrawal-request (withdrawal-id uint))
+    (map-get? emergency-withdrawals { withdrawal-id: withdrawal-id })
+)
+
+(define-read-only (get-withdrawal-objection
+        (withdrawal-id uint)
+        (objector principal)
+    )
+    (map-get? withdrawal-objections {
+        withdrawal-id: withdrawal-id,
+        objector: objector,
+    })
+)
+
+(define-read-only (get-emergency-withdrawal-delay)
+    (var-get emergency-withdrawal-delay)
+)
+
+(define-read-only (is-withdrawal-executable (withdrawal-id uint))
+    (match (map-get? emergency-withdrawals { withdrawal-id: withdrawal-id })
+        withdrawal-data (and
+            (not (get executed withdrawal-data))
+            (>= stacks-block-height (get executable-at withdrawal-data))
+        )
+        false
+    )
 )
