@@ -13,6 +13,8 @@
 (define-constant err-withdrawal-period-not-ended (err u111))
 (define-constant err-insufficient-campaign-funds (err u112))
 (define-constant err-withdrawal-amount-invalid (err u113))
+(define-constant err-not-eligible-refund (err u114))
+(define-constant err-no-donation (err u115))
 
 (define-data-var next-campaign-id uint u1)
 (define-data-var total-campaigns uint u0)
@@ -362,6 +364,54 @@
             (merge campaign-data { raised-amount: u0 })
         )
         (ok true)
+    )
+)
+
+(define-public (claim-refund (campaign-id uint))
+    (let (
+            (campaign-data (unwrap! (map-get? campaigns { campaign-id: campaign-id })
+                err-not-found
+            ))
+            (donation-opt (map-get? donations {
+                campaign-id: campaign-id,
+                donor: tx-sender,
+            }))
+            (current-height stacks-block-height)
+        )
+        (asserts! (not (is-eq (get status campaign-data) "completed"))
+            err-not-eligible-refund
+        )
+        (asserts!
+            (or
+                (is-eq (get status campaign-data) "expired")
+                (and (>= current-height (get deadline campaign-data)) (< (get raised-amount campaign-data)
+                    (get target-amount campaign-data)
+                ))
+            )
+            err-not-eligible-refund
+        )
+        (asserts! (is-some donation-opt) err-no-donation)
+        (let (
+                (donation (unwrap! donation-opt err-no-donation))
+                (amount (get amount donation))
+            )
+            (asserts! (> amount u0) err-not-eligible-refund)
+            (asserts! (<= amount (get raised-amount campaign-data))
+                err-insufficient-campaign-funds
+            )
+            (try! (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender)))
+            (map-set campaigns { campaign-id: campaign-id }
+                (merge campaign-data { raised-amount: (- (get raised-amount campaign-data) amount) })
+            )
+            (map-set donations {
+                campaign-id: campaign-id,
+                donor: tx-sender,
+            } {
+                amount: u0,
+                timestamp: current-height,
+            })
+            (ok true)
+        )
     )
 )
 
