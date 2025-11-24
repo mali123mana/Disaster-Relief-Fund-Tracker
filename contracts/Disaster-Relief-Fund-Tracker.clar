@@ -15,6 +15,8 @@
 (define-constant err-withdrawal-amount-invalid (err u113))
 (define-constant err-not-eligible-refund (err u114))
 (define-constant err-no-donation (err u115))
+(define-constant err-campaign-paused (err u116))
+(define-constant err-campaign-not-paused (err u117))
 
 (define-data-var next-campaign-id uint u1)
 (define-data-var total-campaigns uint u0)
@@ -33,6 +35,7 @@
         deadline: uint,
         status: (string-ascii 20),
         created-at: uint,
+        paused: bool,
     }
 )
 
@@ -106,6 +109,7 @@
             deadline: deadline,
             status: "active",
             created-at: current-height,
+            paused: false,
         })
         (map-set campaign-donors { campaign-id: campaign-id } { donor-count: u0 })
         (var-set next-campaign-id (+ campaign-id u1))
@@ -144,6 +148,7 @@
         (asserts! (is-eq (get status campaign-data) "active")
             err-campaign-completed
         )
+        (asserts! (not (get paused campaign-data)) err-campaign-paused)
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (let (
                 (new-raised (+ (get raised-amount campaign-data) amount))
@@ -228,9 +233,38 @@
         (asserts! (is-eq (get status campaign-data) "active")
             err-campaign-completed
         )
+        (asserts! (not (get paused campaign-data)) err-campaign-paused)
         (asserts! (> additional-duration u0) err-invalid-duration)
         (map-set campaigns { campaign-id: campaign-id }
             (merge campaign-data { deadline: (+ (get deadline campaign-data) additional-duration) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (pause-campaign (campaign-id uint))
+    (let ((campaign-data (unwrap! (map-get? campaigns { campaign-id: campaign-id }) err-not-found)))
+        (asserts! (is-eq (get creator campaign-data) tx-sender) err-unauthorized)
+        (asserts! (is-eq (get status campaign-data) "active")
+            err-campaign-completed
+        )
+        (asserts! (not (get paused campaign-data)) err-campaign-paused)
+        (map-set campaigns { campaign-id: campaign-id }
+            (merge campaign-data { paused: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resume-campaign (campaign-id uint))
+    (let ((campaign-data (unwrap! (map-get? campaigns { campaign-id: campaign-id }) err-not-found)))
+        (asserts! (is-eq (get creator campaign-data) tx-sender) err-unauthorized)
+        (asserts! (is-eq (get status campaign-data) "active")
+            err-campaign-completed
+        )
+        (asserts! (get paused campaign-data) err-campaign-not-paused)
+        (map-set campaigns { campaign-id: campaign-id }
+            (merge campaign-data { paused: false })
         )
         (ok true)
     )
@@ -469,7 +503,18 @@
 
 (define-read-only (is-campaign-active (campaign-id uint))
     (match (map-get? campaigns { campaign-id: campaign-id })
-        campaign-data (and (is-eq (get status campaign-data) "active") (< stacks-block-height (get deadline campaign-data)))
+        campaign-data (and
+            (is-eq (get status campaign-data) "active")
+            (not (get paused campaign-data))
+            (< stacks-block-height (get deadline campaign-data))
+        )
+        false
+    )
+)
+
+(define-read-only (is-campaign-paused (campaign-id uint))
+    (match (map-get? campaigns { campaign-id: campaign-id })
+        campaign-data (get paused campaign-data)
         false
     )
 )
